@@ -45,18 +45,79 @@ async function post(url) {
 
 document.querySelectorAll("button[data-act]").forEach((btn) => {
   btn.addEventListener("click", () => {
+    const act = btn.dataset.act;
+    if (act === "import") {
+      uploadMbtiles();
+      return;
+    }
     const kind = btn.closest(".panel").id.replace("panel-", "");
-    if (btn.dataset.act === "start") {
+    if (act === "start") {
       let url = `/api/jobs/${kind}/start`;
       if (kind === "emergency" && document.getElementById("simulate-fail").checked) {
         url += "?simulate_fail=true";
       }
       post(url);
-    } else if (btn.dataset.act === "reset") {
+    } else if (act === "reset") {
       post(`/api/jobs/${kind}/reset`);
     }
   });
 });
+
+async function uploadMbtiles() {
+  const input = document.getElementById("mbtiles-file");
+  const info = document.getElementById("import-info");
+  if (!input.files.length) {
+    alert("请先选择 .mbtiles 文件（可先下载本地样包）");
+    return;
+  }
+  const file = input.files[0];
+  if (file.size > 8 * 1024 * 1024) {
+    alert(`包 ${file.size} 字节，超过 8 MiB 上限`);
+    return;
+  }
+  const fd = new FormData();
+  fd.append("file", file);
+  info.textContent = `上传中：${file.name}（${file.size} 字节）…`;
+  const fail = document.getElementById("import-fail").checked ? "?import_fail_after=10" : "";
+  let r;
+  try {
+    r = await fetch(`/api/import/mbtiles${fail}`, { method: "POST", body: fd });
+  } catch (e) {
+    info.textContent = "上传失败：网络错误";
+    return;
+  }
+  if (!r.ok) {
+    let t = "";
+    try { t = await r.text(); } catch (e) { t = String(e); }
+    info.textContent = `上传被拒绝：HTTP ${r.status} ${t}`;
+    return;
+  }
+  poll();
+}
+
+const IMPORT_STATE = {
+  verifying: "验包中", accepted: "已导入", rejected: "已拒收",
+  partial: "导入中断（可重传）", void: "已作废（验包期间常规被重置）",
+};
+
+function renderImport(imp) {
+  const info = document.getElementById("import-info");
+  if (!imp || !imp.latest) {
+    return;
+  }
+  const it = imp.latest;
+  const state = it.state;
+  let text = `【${IMPORT_STATE[state] || state}】${it.filename} · SHA-256 ${it.checksum.slice(0, 12)}…`;
+  text += ` · ${it.message}`;
+  if (state === "verifying") {
+    text += ` · 已收 ${it.received} 张`;
+  } else if (it.progress && (it.progress.imported || it.progress.skipped)) {
+    text += ` · 补空位 ${it.progress.imported}，已存在跳过 ${it.progress.skipped}`;
+  }
+  if (it.duration_ms) text += ` · 用时 ${it.duration_ms} ms`;
+  info.textContent = text;
+  info.dataset.state = state;
+}
 
 async function poll() {
   let s;
@@ -99,6 +160,7 @@ async function poll() {
       }
     }
   }
+  renderImport(s.import);
 }
 
 setInterval(poll, 500);

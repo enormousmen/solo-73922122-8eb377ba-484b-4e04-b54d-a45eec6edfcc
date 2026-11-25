@@ -5,7 +5,8 @@
 - 应急任务受理后立即中止正在渲染的常规子进程（stdin 中止指令 + SIGTERM 双通道），
   等它退出后再开应急；
 - 被中止时正在渲染、尚未发布的常规瓦片直接舍弃，恢复后重算；
-- 应急无论成功/失败，常规切片都会自动续做；已发布瓦片不重算、照常可取。
+- 应急无论成功/失败，常规切片都会自动续做；已发布瓦片不重算、照常可取；
+- 导入线程发布新坐标后，通过线程安全回调把进度同步给调度循环，切片随即跳过该坐标。
 """
 from __future__ import annotations
 
@@ -13,8 +14,11 @@ import asyncio
 import json
 import shutil
 import sys
+import threading
 import time
 from pathlib import Path
+
+from .imports import ImportManager
 
 TILE_SIZE = 256
 ZOOMS = [0, 1, 2, 3]
@@ -55,8 +59,13 @@ class Job:
         return self.out_dir / str(z) / str(x) / f"{y}.png"
 
     def rescan(self) -> None:
-        """以磁盘为准重建已发布集合（启动时、每轮子进程结束后调用）。"""
+        """以磁盘为准重建已发布集合（启动时、每轮子进程结束后调用）。
+
+        任务进行中只刷新已发布集合，不改状态（避免与调度循环的状态迁移冲突）。
+        """
         self.published = {t for t in all_tiles() if self.tile_file(t).is_file()}
+        if self.status in ACTIVE:
+            return
         if not self.published:
             self.status = "idle"
         elif len(self.published) == TOTAL:
@@ -81,7 +90,7 @@ class Job:
 
 
 class Scheduler:
-    def __init__(self, data_dir: Path, tile_delay: float):
+    def __init__(self, data_dir: Path, tile_delay: float, import_delay: float = 0.0):
         self.data_dir = data_dir
         self.tile_delay = tile_delay
         self.jobs = {k: Job(k, data_dir) for k in KINDS}
@@ -90,13 +99,51 @@ class Scheduler:
         self._wake = asyncio.Event()
         self._task: asyncio.Task | None = None
         self._worker_py = Path(__file__).resolve().parent / "worker.py"
+        # 常规任务重置计数：导入受理时记录；导入期间被重置（计数变化）则该包作废。
+        # RLock：导入线程按包内逐张发布时持有，重置也持有，二者不会与删目录交叉。
+        self._epoch = 0
+        self._epoch_lock = threading.RLock()
+        self._loop_obj: asyncio.AbstractEventLoop | None = None
+        self.imports = ImportManager(
+            data_dir, self.jobs["regular"].src, self.jobs["regular"].out_dir,
+            epoch=self.epoch, epoch_lock=self._epoch_lock, verify_delay=import_delay,
+        )
+        self.imports.on_tile = self._on_imported_tile
+        self.imports.on_done = self._on_import_done
+
+    # ---------- 导入回调 ----------
+
+    def epoch(self) -> int:
+        with self._epoch_lock:
+            return self._epoch
+
+    def _on_imported_tile(self, z: int, x: int, y: int) -> None:
+        """导入线程每发布一张就同步进内存集合；页面进度立即可见，切片随即跳过该坐标。"""
+        self.jobs["regular"].published.add((z, x, y))
+        self._wake_from_thread()
+
+    def _on_import_done(self) -> None:
+        """导入结束：按磁盘重新对齐已发布集合，并唤醒调度循环（续做或标记完成）。"""
+        self.jobs["regular"].rescan()
+        self._wake_from_thread()
+
+    def _wake_from_thread(self) -> None:
+        if self._loop_obj:
+            try:
+                self._loop_obj.call_soon_threadsafe(self._wake.set)
+            except RuntimeError:  # 事件循环已关闭
+                pass
 
     # ---------- 生命周期 ----------
 
     def start(self) -> None:
+        self._loop_obj = asyncio.get_running_loop()
+        self.imports.cleanup_orphans()
         self._task = asyncio.create_task(self._loop(), name="tile-scheduler")
 
     async def shutdown(self) -> None:
+        # 先停导入线程（它可能仍在写瓦片），再停渲染子进程
+        self.imports.shutdown()
         if self.proc and self.proc.returncode is None:
             self._stop_proc(self.proc)
             try:
@@ -129,6 +176,7 @@ class Scheduler:
         job = self.jobs[kind]
         if job.status in ACTIVE:
             return job  # 幂等：已排队/在跑/被抢占待续，不重复受理
+        job.rescan()  # 以磁盘为准刷新，导入补上的空位不重复渲染
         if not job.remaining():
             job.status = "done"
             return job
@@ -150,7 +198,13 @@ class Scheduler:
         job = self.jobs[kind]
         if job.status in ACTIVE:
             raise RuntimeError("任务进行中，无法重置")
-        shutil.rmtree(job.out_dir, ignore_errors=True)
+        if kind == "regular":
+            # 与导入线程的发布互斥：先递增重置计数使在途包作废，再清目录。
+            with self._epoch_lock:
+                self._epoch += 1
+                shutil.rmtree(job.out_dir, ignore_errors=True)
+        else:
+            shutil.rmtree(job.out_dir, ignore_errors=True)
         job.out_dir.mkdir(parents=True, exist_ok=True)
         job.published.clear()
         job.status = "idle"
@@ -162,7 +216,9 @@ class Scheduler:
     # ---------- 调度主循环 ----------
 
     def _pick(self) -> str | None:
-        em, rg = self.jobs["emergency"], self.jobs["regular"]
+        em = self.jobs["emergency"]
+        rg = self.jobs["regular"]
+        rg.rescan()  # 导入线程可能在两轮之间补了空位，以磁盘为准刷新集合
         if em.status == "queued" and em.remaining():
             return "emergency"  # 应急优先
         if rg.status in ("queued", "interrupted") and rg.remaining():
@@ -197,6 +253,9 @@ class Scheduler:
             "--zooms", ",".join(map(str, ZOOMS)),
             "--delay", str(self.tile_delay),
         ]
+        if kind == "regular":
+            # 导入包暂存目录：worker 启动时顺带清理残留临时文件，不改动已发布瓦片
+            cmd += ["--input-dir", str(self.data_dir / "uploads")]
         if kind == "emergency" and job.simulate_fail:
             cmd += ["--fail-after", "10"]  # 自测钩子：发布 10 张后模拟崩溃
         logf = open(job.log_file, "ab")
@@ -229,7 +288,7 @@ class Scheduler:
             job.finished_at = time.time()
             job.rescan()  # 以磁盘为准对齐已发布集合
         if rc == 0:
-            job.status = "done"
+            job.status = "done" if not job.remaining() else "idle"
         elif rc == ABORT_RC or rc < 0:
             # 被应急任务中止（stdin 指令或 SIGTERM）；若恰好已全部发布则视为完成
             job.status = "done" if not job.remaining() else "interrupted"
@@ -243,7 +302,8 @@ class Scheduler:
             job.plan_info = {"total": ev["total"], "remaining": ev["remaining"]}
         elif kind == "start_tile":
             job.current_tile = (ev["z"], ev["x"], ev["y"])
-        elif kind == "tile":
+        elif kind in ("tile", "skip"):
+            # tile=本进程实际出图；skip=该坐标已有先发布的文件（导入/前一轮），不覆盖
             job.published.add((ev["z"], ev["x"], ev["y"]))
             job.current_tile = None
         elif kind == "error":
@@ -262,4 +322,5 @@ class Scheduler:
             "running_kind": self.running_kind,
             "tile_delay": self.tile_delay,
             "jobs": {k: j.snapshot() for k, j in self.jobs.items()},
+            "import": self.imports.snapshot(),
         }

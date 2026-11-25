@@ -4,7 +4,8 @@ services:
     ports:
       - "8000:8000"
     environment:
-      TILE_DELAY: "0.15"   # 每张瓦片的模拟渲染耗时，调大可放慢演示节奏
+      TILE_DELAY: "0.15"          # 每张瓦片的模拟渲染耗时，调大可放慢演示节奏
+      IMPORT_VERIFY_DELAY: "0"    # 每张导入瓦片的模拟验包耗时，调大可观察"验包期间照常切片"
     volumes:
-      - ./data:/data       # 源图与已发布瓦片持久化
+      - ./data:/data              # 源图、已发布瓦片、上传暂存持久化
     restart: unless-stopped

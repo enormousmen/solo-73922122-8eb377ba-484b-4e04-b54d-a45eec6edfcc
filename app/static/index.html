@@ -36,9 +36,23 @@
   </section>
 </div>
 
+<section class="panel import-panel">
+  <h2>常规源图 · 导入已切好的 MBTiles 包</h2>
+  <div class="ops">
+    <input type="file" id="mbtiles-file" accept=".mbtiles,.sqlite,.db">
+    <button data-act="import">上传并验包</button>
+    <a class="dl" href="/samples/regular-partial.mbtiles" download>下载本地样包</a>
+    <label class="chk"><input type="checkbox" id="import-fail"> 模拟写盘中途失败</label>
+  </div>
+  <p id="import-info" class="info">未上传。单包 ≤ 8 MiB；metadata.source_sha256 须与常规源图一致；
+    只收 z0–z3 的 256×256 PNG，行号按从南向北换算。验包通过后只补空位，已有的文件不覆盖。</p>
+</section>
+
 <p class="hint">
 演示：先点「启动切片」让常规底图渲染到一半，再点「启动应急切片（插队）」——常规立即中止，
 应急算完后常规自动续做，已发布瓦片不重算。点击任意瓦片可打开对应 PNG。
+导入：先「下载本地样包」，再选择该文件「上传并验包」——验包期间切片照常进行，
+通过后只补空位，进度按实际出图坐标计，后续切片跳过已导入的图。
 </p>
 <script src="/app.js"></script>
 </body>
